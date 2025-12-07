@@ -27,6 +27,8 @@ def main(event: func.EventGridEvent):
         source_type = "UPI"
     elif "customer" in file_name.lower():
         source_type = "CUSTOMER"
+    elif "account" in file_name.lower():
+        source_type = "ACCOUNT"
     else:
         source_type = "UNKNOWN"
 
