@@ -1,4 +1,16 @@
-# processor/customer_processor.py
+"""
+Processor to ingest and merge customer profiles into Cosmos DB profile documents.
+
+Responsibilities:
+- Parse customer CSV, validate each row, build Customer subdocuments and merge
+  them into existing profile documents or insert standalone customer docs.
+- Return ingestion metadata summarizing rows processed and success/failure counts.
+
+Notes:
+- This module performs network I/O (cosmos queries/upserts) and logs errors but
+  attempts best-effort processing.
+"""
+
 import logging
 from typing import Dict, Any, List
 
@@ -9,8 +21,22 @@ from ..utils.sanitizer import strip, to_float
 from ..validator.customer_validator import validate_customer_row
 from ..client.cosmos_client import upsert_item, upsert_items_parallel
 
+
 def _build_customer_subdoc(row: Dict[str, Any]) -> Dict[str, Any]:
-    # Normalize and return the Customer subdocument
+    """
+    Build a normalized Customer subdocument from a CSV row.
+
+    Behavior:
+    - Trims string fields using `strip`.
+    - Parses DOB into an ISO string if parseable.
+    - Coerces AnnualIncome to float, defaulting to 0.0 when missing.
+
+    Args:
+        row: Raw CSV row mapping headers to raw values.
+
+    Returns:
+        A dict representing the Customer subdocument ready to embed in profile docs.
+    """
     cust = {
         "CustomerID": strip(row.get("CustomerID")),
         "FirstName": strip(row.get("FirstName")),
@@ -26,36 +52,61 @@ def _build_customer_subdoc(row: Dict[str, Any]) -> Dict[str, Any]:
         "KYC_Status": strip(row.get("KYC_Status")),
         "KYC_Tier": strip(row.get("KYC_Tier")),
         "Occupation": strip(row.get("Occupation")),
-        "AnnualIncome": None
+        "AnnualIncome": None,
     }
 
+    # Parse DOB using shared date utility which handles vendor quirks
     dob_dt = parse_ts(row.get("DOB"))
     if dob_dt:
-        cust["DOB"] = dob_dt.isoformat()
+        # Store DOB as a date-only string (YYYY-MM-DD). This avoids producing
+        # ISO datetimes like '1977-08-11T00:00:00' when the time component is not
+        # meaningful for DOB fields.
+        try:
+            cust["DOB"] = dob_dt.date().isoformat()
+        except Exception:
+            # Fallback: if dob_dt is already a date or something unexpected,
+            # coerce to string safely
+            cust["DOB"] = str(dob_dt)
 
+    # AnnualIncome should be numeric; fallback to 0.0 when missing
     ai = to_float(row.get("AnnualIncome"))
     cust["AnnualIncome"] = ai if ai is not None else 0.0
 
     return cust
 
+
 def process_customer_profiles(text: str, file_name: str, profile_container) -> Dict[str, Any]:
     """
     Process customer_master CSV content, merge into existing profile docs by CustomerID.
-    If no account doc exists for a CustomerID, create a CUSTOMER_{CustomerID} doc.
-    Returns metadata dict.
+
+    Flow:
+    - Parse CSV rows
+    - Validate each row
+    - For valid rows, build a Customer subdocument and either merge into existing
+      profile documents (matched by CustomerID) or create a standalone customer doc.
+
+    Args:
+        text: CSV content as string.
+        file_name: Source filename (used for metadata/quarantine naming).
+        profile_container: Cosmos container client for profile documents.
+
+    Returns:
+        Metadata dict summarizing rows_parsed, valid, invalid, quarantined, alerts.
     """
     rows = parse_csv(text)
     total = len(rows)
     if total == 0:
         return {"rows_parsed": 0, "valid": 0, "invalid": 0, "quarantined": 0, "alerts": 0}
 
-    valid_customers = []
-    bad_rows = []
+    valid_customers: List[Dict[str, Any]] = []
+    bad_rows: List[List[str]] = []
     header = list(rows[0].keys()) if rows else []
 
+    # Validate rows using shared validator
     for i, raw in enumerate(rows, start=1):
         errors = validate_customer_row(raw)
         if errors:
+            # Store original row aligned with header for quarantine
             bad_rows.append([raw.get(h, "") for h in header])
             logging.warning(f"Customer row {i} invalid: {errors}")
         else:
@@ -79,7 +130,9 @@ def process_customer_profiles(text: str, file_name: str, profile_container) -> D
         try:
             query = "SELECT * FROM c WHERE c.CustomerID=@cid"
             params = [{"name": "@cid", "value": cid}]
-            items = list(profile_container.query_items(query=query, parameters=params, enable_cross_partition_query=True))
+            items = list(
+                profile_container.query_items(query=query, parameters=params, enable_cross_partition_query=True)
+            )
         except Exception as e:
             logging.error(f"Failed to query profile docs for CustomerID={cid}: {e}")
             items = []
@@ -89,6 +142,7 @@ def process_customer_profiles(text: str, file_name: str, profile_container) -> D
             updated_docs = []
             for doc in items:
                 doc["Customer"] = customer_subdoc
+                # Ensure doc has an id suitable for Cosmos upsert
                 if not doc.get("id"):
                     doc["id"] = doc.get("AccountNumber") or f"CUSTOMER_{cid}"
                 doc["CustomerID"] = cid
@@ -102,11 +156,7 @@ def process_customer_profiles(text: str, file_name: str, profile_container) -> D
                 failed += len(updated_docs)
         else:
             # No account docs exist; create a standalone customer doc
-            cust_doc = {
-                "id": f"CUSTOMER_{cid}",
-                "CustomerID": cid,
-                "Customer": customer_subdoc
-            }
+            cust_doc = {"id": f"CUSTOMER_{cid}", "CustomerID": cid, "Customer": customer_subdoc}
             try:
                 upsert_item(profile_container, cust_doc)
                 success += 1
@@ -119,5 +169,5 @@ def process_customer_profiles(text: str, file_name: str, profile_container) -> D
         "valid": len(valid_customers),
         "invalid": len(bad_rows),
         "quarantined": quarantined,
-        "alerts": 0  # customer ingestion doesn't create profile alerts in Option A
+        "alerts": 0,  # customer ingestion doesn't create profile alerts in this flow
     }
