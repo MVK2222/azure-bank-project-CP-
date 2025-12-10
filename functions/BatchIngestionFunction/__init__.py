@@ -1,8 +1,20 @@
+"""
+Azure Function handler for batch ingestion pipeline.
+
+This module wires blob read, source detection and dispatch to specialized
+processors (ATM, UPI, Account, Customer). It also writes metadata and
+quarantine blobs into storage.
+
+Environment variables used (from module scope):
+- STORAGE_CONNECTION_STRING
+- ATM_CONTAINER, UPI_CONTAINER, PROFILE_CONTAINER, ALERTS_CONTAINER
+- METADATA_CONTAINER, QUARANTINE_CONTAINER
+"""
+
 import json
 import logging
 import os
 import azure.functions as func
-from datetime import datetime, timezone
 import csv
 import io
 
@@ -31,7 +43,7 @@ ALERT_CONTAINER_NAME = os.environ.get("ALERTS_CONTAINER", "FraudAlerts")
 METADATA_CONTAINER = os.environ.get("METADATA_CONTAINER", "metadata")
 QUARANTINE_CONTAINER = os.environ.get("QUARANTINE_CONTAINER", "quarantine")
 
-# Cosmos DB containers
+# Cosmos DB containers (created on import)
 atm_container = get_or_create_container(ATM_CONTAINER_NAME, "/AccountNumber")
 upi_container = get_or_create_container(UPI_CONTAINER_NAME, "/AccountNumber")
 profile_container = get_or_create_container(PROFILE_CONTAINER_NAME, "/CustomerID")
@@ -45,11 +57,20 @@ from azure.storage.blob import BlobServiceClient
 _STORAGE_CONN = os.environ.get("STORAGE_CONNECTION_STRING")
 _blob_client = BlobServiceClient.from_connection_string(_STORAGE_CONN)
 
+
 def write_metadata_blob(file_name: str, metadata: dict):
+    """
+    Persist metadata JSON blob for a processed file.
+
+    Args:
+        file_name: Base filename used to name the metadata blob.
+        metadata: Arbitrary metadata mapping to be JSON serialized.
+    """
     container_client = _blob_client.get_container_client(METADATA_CONTAINER)
     try:
+        # create_container may fail if it already exists — ignore errors
         container_client.create_container()
-    except:
+    except Exception:
         pass
 
     blob = container_client.get_blob_client(f"{file_name}.metadata.json")
@@ -60,12 +81,20 @@ def write_metadata_blob(file_name: str, metadata: dict):
 # Helper: write quarantine CSV
 # -------------------------------------------------------------------
 def write_quarantine_blob(base_file_name: str, header, bad_rows):
+    """
+    Persist a quarantine CSV containing header and bad rows.
+
+    Args:
+        base_file_name: Source filename used for naming the quarantine blob.
+        header: List of column names.
+        bad_rows: Iterable of row lists (aligned with header) to write.
+    """
     if not bad_rows:
         return
     container_client = _blob_client.get_container_client(QUARANTINE_CONTAINER)
     try:
         container_client.create_container()
-    except:
+    except Exception:
         pass
 
     buf = io.StringIO()
@@ -82,6 +111,19 @@ def write_quarantine_blob(base_file_name: str, header, bad_rows):
 # MAIN ENTRY FUNCTION
 # -------------------------------------------------------------------
 def main(msg: func.ServiceBusMessage):
+    """
+    Azure Function entrypoint triggered by Service Bus messages produced by the FileArrivalFunction.
+
+    Expected message body (JSON): {"file_url": <blob_url>, "file_name": <filename>, "source_type": <optional>}.
+
+    Flow:
+    - Read message and download blob content
+    - Detect source type and dispatch to appropriate processor
+    - Handle quarantine blobs and persist metadata
+
+    Error handling:
+    - Failures are logged and metadata is updated with status and error text.
+    """
     logging.info("BatchIngestionFunction triggered.")
 
     # -----------------------------
@@ -110,7 +152,7 @@ def main(msg: func.ServiceBusMessage):
         "file_url": file_url,
         "source_type": source_type,
         "status": "PROCESSING",
-        "started_at": utcnow().isoformat()
+        "started_at": utcnow().isoformat(),
     }
     write_metadata_blob(file_name, metadata)
 
@@ -160,25 +202,31 @@ def main(msg: func.ServiceBusMessage):
     # ---------------------------------
     # Handle quarantine (if any)
     # ---------------------------------
-    if result.get("invalid", 0) > 0:
-        # We need header + bad rows — processors do not store them.
-        # Instead, re-parse CSV here and collect invalid rows
-        rows = text.splitlines()
-        header = rows[0].split(",")
-        # A simple fallback; actual processors could return bad_rows if needed.
+    # processors now return 'bad_rows' and 'header' for quarantine
+    bad_rows = result.get("bad_rows")
+    header = result.get("header")
+    if bad_rows and header:
+        try:
+            write_quarantine_blob(file_name, header, bad_rows)
+            logging.info(f"Wrote {len(bad_rows)} bad rows to quarantine for {file_name}")
+        except Exception as e:
+            logging.error(f"Failed to write quarantine blob: {e}")
+
 
     # ---------------------------------
     # Finalize metadata
     # ---------------------------------
-    metadata.update({
-        "status": "COMPLETED",
-        "completed_at": utcnow().isoformat(),
-        "rows_parsed": result.get("rows_parsed", 0),
-        "valid": result.get("valid", 0),
-        "invalid": result.get("invalid", 0),
-        "quarantined": result.get("quarantined", 0),
-        "alerts_generated": result.get("alerts", 0)
-    })
+    metadata.update(
+        {
+            "status": "COMPLETED",
+            "completed_at": utcnow().isoformat(),
+            "rows_parsed": result.get("rows_parsed", 0),
+            "valid": result.get("valid", 0),
+            "invalid": result.get("invalid", 0),
+            "quarantined": result.get("quarantined", 0),
+            "alerts_generated": result.get("alerts", 0),
+        }
+    )
 
     write_metadata_blob(file_name, metadata)
 
