@@ -86,6 +86,13 @@ def main(event: func.EventGridEvent):
 
     # Extract blob metadata from Event Grid event
     event_data = event.get_json()
+    
+    # Validate Event Grid event data structure
+    # Event Grid should always include 'url' field, but validate to prevent KeyError
+    if "url" not in event_data:
+        logging.error("Event Grid event missing 'url' field. Event data: %s", event_data)
+        return  # Early return prevents downstream errors
+    
     url = event_data["url"]                         # Full blob URL with storage account and path
     file_name = url.split("/")[-1]                 # Extract filename from URL path (last segment)
 

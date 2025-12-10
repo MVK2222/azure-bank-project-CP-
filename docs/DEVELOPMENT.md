@@ -95,9 +95,12 @@ sudo apt install git
 
 ### 1. Clone Repository
 ```bash
-# Clone the project
+# Clone the project (replace YOUR_ORG with your GitHub organization or username)
 git clone https://github.com/YOUR_ORG/azure-bank-project-CP-.git
 cd azure-bank-project-CP-
+
+# Example with actual repository:
+# git clone https://github.com/MVK2222/azure-bank-project-CP-.git
 
 # Check out development branch
 git checkout develop  # Or main, depending on your workflow

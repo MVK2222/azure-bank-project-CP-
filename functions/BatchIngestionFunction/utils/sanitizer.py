@@ -122,7 +122,9 @@ def to_float(value):
         
         # Convert to float (handles int, float, numeric string)
         return float(value)
-    except (ValueError, TypeError, AttributeError):
+    except (ValueError, TypeError):
+        # ValueError: Invalid numeric format (e.g., "abc")
+        # TypeError: None or incompatible type passed to float()
         # Conversion failed - return None for safe handling
         return None
 

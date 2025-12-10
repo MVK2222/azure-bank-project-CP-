@@ -335,11 +335,17 @@ def fraud_detection(parsed_rows):
                 
                 # Alert if different locations within impossible timeframe
                 if loc1 != loc2 and (t2 - t1) <= timedelta(minutes=10):
+                    # Find actual transaction records for these timestamps
+                    # (timestamps list contains (location, timestamp) tuples, not full transactions)
+                    txn1 = next((r for ts, r in items if ts == t1), None)
+                    txn2 = next((r for ts, r in items if ts == t2), None)
+                    
                     alerts.append({
                         "alert_id": f"ALERT_GEO_{cid}_{t1.isoformat()}",
                         "type": "GEO_LOCATION_SWITCH",
                         "reason": f"Transaction from {loc1} → {loc2} within 10 minutes",
-                        "transactions": [timestamps[i], timestamps[j]]  # Both locations preserved
+                        "transactions": [txn1, txn2] if txn1 and txn2 else [],  # Full transaction dicts for consistency
+                        "locations": [(loc1, t1.isoformat()), (loc2, t2.isoformat())]  # Location metadata
                     })
                     # Note: Not breaking allows detection of multiple location switches
 
