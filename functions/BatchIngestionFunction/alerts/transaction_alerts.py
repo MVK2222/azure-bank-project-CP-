@@ -267,57 +267,161 @@ def fraud_detection(parsed_rows):
                 # Note: Breaking here would miss overlapping velocity windows
                 # Keeping loop finds all velocity bursts for thorough detection
 
-    # --------------------------------------
-    # RULE 3: GEO LOCATION SWITCHING FRAUD
-    # --------------------------------------
+    # ================================================================================
+    # RULE 3: GEO-LOCATION SWITCHING FRAUD (Impossible Travel)
+    # ================================================================================
+    # Fraud Pattern: Physically Impossible Transaction Locations
+    #
+    # Attack Scenarios:
+    # - Card cloning: Original card in Mumbai, cloned card used in Delhi simultaneously
+    # - Account sharing: Credentials shared across different cities
+    # - Credential theft: Stolen credentials used from different geographic location
+    # - Travel fraud: Card used at airport then at distant city before flight lands
+    #
+    # Detection Logic:
+    # - Track all transaction locations per customer
+    # - Identify location changes that occur within impossible timeframe
+    # - Alert if transactions from different cities within 10 minutes
+    #
+    # Assumptions & Limitations:
+    # - Location granularity: City-level (not GPS coordinates)
+    # - 10-minute window: Conservative (accounts for time zone issues)
+    # - Network transactions (UPI): Location may be mobile, not physical
+    # - ATM transactions: Location is physical ATM address
+    #
+    # False Positive Scenarios:
+    # - VPN usage: User appears in different city due to VPN exit node
+    # - UPI from one city, ATM in another: If cities are nearby or user traveling
+    # - Location data errors: Merchant location misconfigured
+    # - Mobile transactions: Phone location vs actual transaction location
+    #
+    # Improvements Needed:
+    # - Calculate actual distance and travel time (haversine formula)
+    # - Consider transportation speed (car: 60-80 km/h, flight: 800+ km/h)
+    # - Whitelist nearby cities (Delhi-Noida, Mumbai-Thane)
+    # - Different thresholds for ATM vs UPI (UPI more flexible)
+    #
+    # Real-World Example:
+    #   ATM withdrawal in Chennai at 10:00 AM, then UPI payment in Bangalore at 10:05 AM.
+    #   ~350 km distance impossible in 5 minutes. Clear fraud indicator.
+    #
+    # TODO: Integrate geographic distance calculation (geopy library)
+    # TODO: Add travel velocity calculation (km/h between locations)
+    # TODO: Whitelist airport locations (legitimate rapid travel possible)
+    
     for cid, items in by_customer.items():
+        # Build location-to-timestamps mapping for this customer
         loc_map = {}
         for ts, r in items:
             loc = r.get("Location")
-            loc_map.setdefault(loc, []).append(ts)
+            if loc:  # Only process if location data available
+                loc_map.setdefault(loc, []).append(ts)
 
+        # Flatten to list of (location, timestamp) tuples for chronological analysis
         timestamps = []
         for loc, ts_list in loc_map.items():
             for t in ts_list:
                 timestamps.append((loc, t))
 
+        # Sort by timestamp to detect rapid location switches
         timestamps.sort(key=lambda x: x[1])
 
+        # Check each pair of transactions for impossible travel
+        # O(n²) complexity - acceptable for typical customer transaction counts
         for i in range(len(timestamps)):
             loc1, t1 = timestamps[i]
             for j in range(i + 1, len(timestamps)):
                 loc2, t2 = timestamps[j]
+                
+                # Alert if different locations within impossible timeframe
                 if loc1 != loc2 and (t2 - t1) <= timedelta(minutes=10):
                     alerts.append({
                         "alert_id": f"ALERT_GEO_{cid}_{t1.isoformat()}",
                         "type": "GEO_LOCATION_SWITCH",
                         "reason": f"Transaction from {loc1} → {loc2} within 10 minutes",
-                        "transactions": [timestamps[i], timestamps[j]]
+                        "transactions": [timestamps[i], timestamps[j]]  # Both locations preserved
                     })
+                    # Note: Not breaking allows detection of multiple location switches
 
-    # --------------------------------------
-    # RULE 4: BALANCE DRAIN (Many withdrawals fast)
-    # --------------------------------------
+    # ================================================================================
+    # RULE 4: BALANCE DRAIN ATTACK (Account Takeover)
+    # ================================================================================
+    # Fraud Pattern: Rapid Large-Scale Fund Extraction
+    #
+    # Attack Scenarios:
+    # - Account takeover: Fraudster gains full account access, drains balance quickly
+    # - Insider fraud: Employee with system access steals funds
+    # - Malware: Banking trojan authorizes rapid transfers in background
+    # - SIM swap: Fraudster intercepts OTPs, bypasses 2FA, drains account
+    #
+    # Detection Logic:
+    # - Calculate cumulative withdrawal amount per customer
+    # - Alert if total exceeds ₹100,000 within 10-minute window
+    # - Considers all transactions chronologically (even if individually small)
+    #
+    # Why This Rule Complements Rule 1 (High-Value):
+    # - Rule 1: Single ₹75K transaction → 1 alert
+    # - Rule 4: 20x ₹5K transactions in 5 minutes → 1 alert
+    # - Fraudsters often use multiple small transactions to avoid single high-value alerts
+    #
+    # Threshold Rationale:
+    # - ₹100,000 in 10 minutes: Extremely unusual for retail customers
+    # - Business accounts may have higher legitimate volumes
+    # - Consider customer segment and account type for dynamic thresholds
+    #
+    # False Positive Scenarios:
+    # - Business account: Legitimate payroll or vendor payment batches
+    # - Personal emergency: Medical expenses, property transactions
+    # - Account closure: Customer withdrawing all funds before closing account
+    #
+    # Mitigation:
+    # - Whitelist business accounts with expected high-volume activity
+    # - Consider transaction patterns (scheduled vs ad-hoc)
+    # - Alert severity scoring (higher for retail accounts)
+    # - Velocity + amount combination for better accuracy
+    #
+    # Real-World Example:
+    #   Account takeover at 2 AM: 15 UPI transfers (₹7K each) to different accounts
+    #   within 8 minutes. Total ₹105K drained. Classic account takeover pattern.
+    #   Immediate alert enables account freeze before more damage.
+    #
+    # Algorithm Optimization:
+    # - Early termination: Break loop once threshold reached
+    # - Sorted by timestamp: Enables cumulative sum in single pass
+    # - Time Complexity: O(n) per customer
+    #
+    # TODO: Add velocity-weighted scoring (faster drain = higher risk)
+    # TODO: Consider transaction types (transfers more suspicious than bill payments)
+    # TODO: Implement customer-specific thresholds based on account history
+    
     for cid, items in by_customer.items():
-        total_amt = 0
+        total_amt = 0.0
+        
+        # Sort transactions chronologically for cumulative sum
         items_sorted = sorted(items, key=lambda x: x[0])
-        start = items_sorted[0][0]
+        
+        if not items_sorted:
+            continue  # Skip if no transactions for this customer
+            
+        start = items_sorted[0][0]  # First transaction timestamp (window start)
 
+        # Cumulative sum within time window
         for ts, r in items_sorted:
             try:
                 amt = float(r.get("Amount") or 0)
             except:
-                amt = 0
+                amt = 0.0  # Invalid amount format - skip
 
             total_amt += amt
 
+            # Check if drain threshold exceeded within time window
             if (ts - start) <= timedelta(minutes=10) and total_amt >= 100000:
                 alerts.append({
                     "alert_id": f"ALERT_BALANCE_DRAIN_{cid}_{ts.isoformat()}",
                     "type": "BALANCE_DRAIN",
                     "reason": f"Total withdrawals {total_amt} in 10 minutes",
-                    "transactions": [x[1] for x in items_sorted]
+                    "transactions": [x[1] for x in items_sorted]  # All transactions in drain sequence
                 })
-                break
+                break  # One alert per customer sufficient (first drain detected)
 
-    return alerts
+    return alerts  # Return all alerts from all rules
