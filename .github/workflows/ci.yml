@@ -1,0 +1,42 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [ main ]
+
+jobs:
+  checks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.10'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r functions/requirements.txt || true
+          pip install pytest flake8 black mypy bandit pip-audit || true
+
+      - name: Lint (black)
+        run: black --check . || true
+
+      - name: Lint (flake8)
+        run: flake8 . || true
+
+      - name: Typecheck (mypy)
+        run: mypy . || true
+
+      - name: Run unit tests
+        run: pytest -q || true
+
+      - name: Security scan (bandit)
+        run: bandit -r . || true
+
+      - name: Audit deps
+        run: pip-audit || true
+

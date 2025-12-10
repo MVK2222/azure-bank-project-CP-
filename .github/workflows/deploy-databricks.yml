@@ -1,0 +1,34 @@
+name: Deploy Databricks Notebooks
+
+on:
+  push:
+    branches: [ "main" ]
+    paths:
+      - 'ETL/**'
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    env:
+      DATABRICKS_HOST: ${{ secrets.DATABRICKS_HOST }}
+      DATABRICKS_TOKEN: ${{ secrets.DATABRICKS_TOKEN }}
+
+    steps:
+    - uses: actions/checkout@v3
+
+    - name: Install Databricks CLI
+      run: pip install databricks-cli
+
+    - name: Upload Notebooks
+      run: |
+        databricks workspace import_dir \
+          ETL/ \
+          /bank-platform/ETL \
+          --overwrite
+
+    - name: Trigger ETL Job
+      run: |
+        # Note: The job-id is hardcoded. 
+        # You should replace 1234 with your actual Databricks job ID.
+        databricks jobs run-now \
+          --job-id 1234
